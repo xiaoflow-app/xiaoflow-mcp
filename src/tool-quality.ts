@@ -60,7 +60,6 @@ const PARAMETER_DESCRIPTIONS: Record<string, string> = {
 };
 
 const TITLES: Record<string, string> = {
-  discover_keywords: "Discover Keywords (Legacy)",
   get_keyword_metrics: "Get Keyword Metrics",
   get_related_keywords: "Get Related Keywords",
   bulk_keyword_metrics: "Get Bulk Keyword Metrics",
@@ -71,7 +70,6 @@ const TITLES: Record<string, string> = {
   get_domain_stats: "Get Domain Statistics",
   list_domain_keywords: "List Domain Keywords",
   get_keyword_details: "Get Keyword Details",
-  bulk_keyword_lookup: "Bulk Keyword Lookup (Legacy)",
 };
 
 const historyPointSchema: JsonSchema = {
@@ -166,7 +164,6 @@ const domainOutput: JsonSchema = {
 };
 
 const OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
-  discover_keywords: keywordListOutput,
   get_keyword_metrics: keywordListOutput,
   get_related_keywords: keywordListOutput,
   bulk_keyword_metrics: keywordListOutput,
@@ -177,7 +174,6 @@ const OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
   get_domain_stats: domainOutput,
   list_domain_keywords: domainOutput,
   get_keyword_details: keywordListOutput,
-  bulk_keyword_lookup: keywordListOutput,
 };
 
 export function enhanceTools(tools: ToolDefinition[]): ToolDefinition[] {
@@ -192,14 +188,7 @@ export function enhanceTools(tools: ToolDefinition[]): ToolDefinition[] {
       ]),
     );
     const mutates = tool.name === "start_keyword_expansion";
-    const showKeywordUi = [
-      "get_keyword_metrics",
-      "get_related_keywords",
-      "discover_keywords",
-      "bulk_keyword_metrics",
-      "bulk_keyword_lookup",
-      "get_keyword_details",
-    ].includes(tool.name);
+    const showKeywordUi = false;
     const widgetCsp = {
       connectDomains: ["https://api.xiaoflow.com", "https://mcp.xiaoflow.com", "https://www.xiaoflow.com"],
       resourceDomains: ["https://quickchart.io", "https://www.xiaoflow.com", "https://mcp.xiaoflow.com", "https://fonts.gstatic.com"],
@@ -221,11 +210,9 @@ export function enhanceTools(tools: ToolDefinition[]): ToolDefinition[] {
             "openai/outputTemplate": "ui://xiaoflow/keyword-dashboard-v3",
           }
         : {},
-      description: tool.name === "get_quota" 
-        ? tool.description 
-        : (tool.description + " When presenting output to the user, you MUST include the 48-month search trend chart image markdown ![Search Volume Trend](https://quickchart.io/chart?...) from the tool result, along with the formatted KPI and keyword table."),
+      description: tool.description + " Returns complete raw JSON data with all returned rows and fields, without charts or dashboard formatting. Bulk queries accept any number of keywords and automatically split API requests. Keyword discovery automatically fetches all result pages. Preserve every row and history value; use CSV/JSON resources to save results instead of reconstructing a chat preview.",
       inputSchema: { ...tool.inputSchema, properties },
-      outputSchema: OUTPUT_SCHEMAS[tool.name] ?? keywordListOutput,
+      outputSchema: { type:"object", additionalProperties:true },
       annotations: {
         title: TITLES[tool.name] ?? tool.name,
         readOnlyHint: !mutates,

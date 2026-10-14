@@ -130,10 +130,10 @@ function formatExpansionReport(data: any): string {
 
   const results = Array.isArray(data.results) ? data.results : [];
   if (results.length > 0) {
-    report += `\n### 🎯 本任务已发现关键词 (Top ${Math.min(results.length, 12)})\n\n`;
+    report += `\n### 🎯 本任务已发现关键词 (${results.length} rows)\n\n`;
     report += `| 关键词 (Keyword) | 月搜索量 | CPC 出价区间 | 竞争度 |\n`;
     report += `| :--- | :--- | :--- | :--- |\n`;
-    results.slice(0, 12).forEach((kw: any) => {
+    results.forEach((kw: any) => {
       const name = kw.keyword || kw.k || "";
       const vol = (kw.search_volume ?? kw.v ?? 0).toLocaleString();
       const low = Number(kw.top_of_page_bid_low ?? kw.l ?? 0).toFixed(2);
@@ -147,102 +147,78 @@ function formatExpansionReport(data: any): string {
   return report;
 }
 
-export function formatXiaoFlowReport(data: any, toolName: string): string {
-  if (!data || typeof data !== "object") {
-    return JSON.stringify(data);
+function formatDomainKeywordsReport(data: any, toolName: string): string {
+  const domain = data.domain?.domain ?? data.domain ?? data.site ?? "—";
+  const total = Number(data.total ?? 0).toLocaleString();
+  const page = Number(data.page ?? 1);
+  const perPage = Number(data.per_page ?? 50);
+  const traffic = Number(data.domain?.total_organic_traffic ?? 0).toLocaleString();
+  const kwCount = Number(data.domain?.total_organic_keywords ?? 0).toLocaleString();
+  const adSpend = Number(data.domain?.ad_spend ?? 0).toFixed(0);
+  const yoy = Number(data.domain?.yoy_change ?? 0);
+  const keywords: any[] = Array.isArray(data.data) ? data.data : [];
+
+  let report = `## 🌐 XiaoFlow 域名关键词分析: **${domain}**\n\n`;
+
+  // Domain overview stats (only if we have them)
+  if (data.domain && (data.domain.total_organic_traffic > 0 || data.domain.total_organic_keywords > 0)) {
+    report += `### 📊 域名概况\n`;
+    report += `| 指标 | 数值 |\n`;
+    report += `| :--- | :--- |\n`;
+    report += `| 🔍 **自然流量 (Organic Traffic)** | **${traffic}** /月 |\n`;
+    report += `| 🗝️ **关键词总数 (Total Keywords)** | **${kwCount}** |\n`;
+    report += `| 💰 **广告花费估算 (Ad Spend)** | **$${adSpend}** |\n`;
+    report += `| 📈 **年同比变化 (YoY)** | **${yoy > 0 ? "+" : ""}${yoy}%** |\n\n`;
   }
 
-  if (toolName === "start_keyword_expansion" || toolName === "get_keyword_expansion_status") {
-    return formatExpansionReport(data);
+  // Traffic history sparkline
+  const trafficHistory: any[] = Array.isArray(data.traffic_history) ? data.traffic_history : [];
+  if (trafficHistory.length >= 2) {
+    const vols = trafficHistory.map((h: any) => h.v ?? h.volume ?? 0);
+    const min = Math.min(...vols);
+    const max = Math.max(...vols);
+    const chars = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    const spark = max === min
+      ? "▅".repeat(Math.min(vols.length, 12))
+      : vols.map((v: number) => {
+          const idx = Math.min(chars.length - 1, Math.max(0, Math.floor(((v - min) / (max - min)) * (chars.length - 1))));
+          return chars[idx];
+        }).join("");
+    report += `> 📈 **流量趋势 (Traffic Trend)**: \`${spark}\`\n\n`;
   }
 
-  if (toolName === "get_quota" || data.type !== undefined && (data.remaining !== undefined || data.credits !== undefined)) {
-    const type = (data.type || "standard").toUpperCase();
-    const remaining = Number(data.remaining ?? data.credits ?? 0).toLocaleString();
-    const used = Number(data.used ?? 0).toLocaleString();
-    const limit = Number(data.limit ?? 0).toLocaleString();
+  // Keywords table
+  if (keywords.length > 0) {
+    const showing = Math.min(keywords.length, 20);
+    report += `### 🎯 关键词列表 (第 ${page} 页，显示 ${showing} / ${total} 条)\n\n`;
+    report += `| 关键词 (Keyword) | 月搜索量 | CPC 区间 | 竞争度 | 趋势 |\n`;
+    report += `| :--- | :--- | :--- | :--- | :--- |\n`;
 
-    return `## 💳 XiaoFlow 账户额度与计算单元 (CU) 查询\n\n` +
-      `| 账户属性 | 当前状态与配额 |\n` +
-      `| :--- | :--- |\n` +
-      `| 👤 **账户类型** | **${type}** |\n` +
-      `| ⚡ **剩余积分 (Remaining Credits)** | **${remaining} CU** |\n` +
-      `| 📊 **已消耗额度 (Used Credits)** | **${used} CU** |\n` +
-      `| 🔄 **每日限额 (Daily Limit)** | **${limit} CU** |\n\n` +
-      `> 💡 **计费规则**: 每次 Google Ads 关键词全量指标查询消耗 1 计算单元 (CU)。\n` +
-      `> 🔗 [👉 前往 XiaoFlow 个人中心充值或升级套餐](https://www.xiaoflow.com/pricing)\n`;
-  }
-
-  let keywords: any[] = [];
-  if (Array.isArray(data.data)) {
-    keywords = data.data;
-  } else if (Array.isArray(data.results)) {
-    keywords = data.results;
-  } else if (Array.isArray(data)) {
-    keywords = data;
-  } else if (data.keyword || data.k) {
-    keywords = [data];
-  }
-
-  if (keywords.length === 0) {
-    if (data.task_id || data.taskId) {
-      return formatExpansionReport(data);
-    }
-    return JSON.stringify(data, null, 2);
-  }
-
-  const primary = keywords[0];
-  const primaryName = primary.keyword || primary.k || "Keyword";
-  const primarySlug = toSlug(primary.keyword || primary.k || primary.slug || primary.s || primaryName);
-  const primaryVol = (primary.search_volume ?? primary.v ?? 0).toLocaleString();
-  const primaryLow = primary.top_of_page_bid_low ?? primary.l ?? 0;
-  const primaryHigh = primary.top_of_page_bid_high ?? primary.h ?? 0;
-  const primaryComp = primary.competition ?? primary.co ?? "HIGH";
-  const primaryCompIdx = primary.competition_index ?? primary.i ?? 100;
-  const primaryYoY = primary.yoy_growth_percent ?? primary.y ?? 0;
-  const primaryHistory = primary.history ?? primary.t ?? [];
-
-  let report = `## 📊 XiaoFlow 数据分析看板: **${primaryName}**\n\n`;
-
-  // Always put Chart at top
-  if (primaryHistory.length >= 2) {
-    const chartUrl = buildChartUrl(primaryName, primaryHistory);
-    if (chartUrl) {
-      report += `### 📈 48 个月搜索量历史趋势图\n`;
-      report += `![${primaryName} Search Volume Trend](${chartUrl})\n\n`;
-    }
-  }
-
-  report += `### 📋 核心商业与投放指标\n`;
-  report += `| 指标 (Metric) | 核心数值 (Value) | 行业参考 / 评估 (Benchmark) |\n`;
-  report += `| :--- | :--- | :--- |\n`;
-  report += `| 🔍 **月均搜索量 (Monthly Volume)** | **${primaryVol}** /月 | 核心高频搜索需求 |\n`;
-  report += `| 💵 **CPC 竞价区间 (Bid Range)** | **$${Number(primaryLow).toFixed(2)} - $${Number(primaryHigh).toFixed(2)}** | Google Ads 商业出价 |\n`;
-  report += `| 🎯 **竞争度指数 (Competition)** | **${primaryComp} (${primaryCompIdx}/100)** | 投放竞争程度评估 |\n`;
-  report += `| 📈 **年同比趋势 (YoY Growth)** | **${primaryYoY > 0 ? "+" : ""}${primaryYoY}%** | ${primaryYoY >= 0 ? "🔥 需求呈上升态势" : "📉 周期性平稳波动"} |\n\n`;
-
-  if (keywords.length > 1) {
-    report += `### 🎯 相关关键词与长尾商机推荐 (Top ${Math.min(keywords.length, 12)})\n\n`;
-    report += `| 关键词 (Keyword) | 月搜索量 | CPC 出价区间 | 竞争度 | 12M趋势 | 意图 |\n`;
-    report += `| :--- | :--- | :--- | :--- | :--- | :--- |\n`;
-
-    keywords.slice(0, 12).forEach((kw: any) => {
+    keywords.slice(0, 20).forEach((kw: any) => {
       const name = kw.keyword || kw.k || "";
       const vol = (kw.search_volume ?? kw.v ?? 0).toLocaleString();
       const low = Number(kw.top_of_page_bid_low ?? kw.l ?? 0).toFixed(2);
       const high = Number(kw.top_of_page_bid_high ?? kw.h ?? 0).toFixed(2);
-      const comp = kw.competition ?? kw.co ?? "HIGH";
-      const intent = kw.intent ?? kw.it ?? "info";
+      const comp = kw.competition ?? kw.co ?? "—";
       const spark = buildSparkline(kw.history ?? kw.t);
-      const intentTag = intent === "commercial" || intent === "transactional" ? "🛒 商业" : "🔍 信息";
-
-      report += `| **${name}** | \`${vol}\` | $${low} - $${high} | ${comp} | \`${spark || "—"}\` | ${intentTag} |\n`;
+      report += `| **${name}** | \`${vol}\` | $${low} – $${high} | ${comp} | \`${spark || "—"}\` |\n`;
     });
     report += `\n`;
+
+    if (Number(data.total ?? 0) > keywords.length) {
+      report += `> 📌 共 **${total}** 条关键词，当前显示第 ${page} 页。可用 \`page\` 参数翻页。\n`;
+    }
+  } else {
+    report += `> ⚠️ 暂无关键词数据，域名可能尚未被收录或正在更新中。\n`;
   }
 
   report += `> 💡 **数据来源**: XiaoFlow Enterprise Google Ads Intelligence API\n`;
-  report += `> 🔗 [👉 在 XiaoFlow 官网查看【${primaryName}】全量关联词与深度趋势分析](https://www.xiaoflow.com/keywords/${primarySlug})\n`;
+  report += `> 🔗 [👉 在 XiaoFlow 官网查看 ${domain} 完整域名分析](https://www.xiaoflow.com/websites/us/en/${domain})\n`;
 
   return report;
+}
+
+/** Return the complete original data, without charts, KPI decoration or row previews. */
+export function formatXiaoFlowReport(data: any, _toolName: string): string {
+  return JSON.stringify(data, null, 2);
 }

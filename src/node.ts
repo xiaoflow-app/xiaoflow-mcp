@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
+import { completeMetrics, completePages } from "./complete-results.js";
+import { inlineExportResources } from "./keyword-export.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -21,14 +23,14 @@ import {
   parseSeedList,
 } from "./expansion.js";
 
-function toolResult(data: unknown, isError = false) {
+function toolResult(data: unknown, isError = false, toolName = "") {
   const structuredContent =
     data !== null && typeof data === "object" && !Array.isArray(data)
       ? data as Record<string, unknown>
       : { success: !isError, data };
 
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(data) }],
+    content: [{ type: "text" as const, text: JSON.stringify(data) }, ...(!isError && toolName.startsWith("bulk_keyword_") ? inlineExportResources(data, toolName) : [])],
     structuredContent,
     ...(isError ? { isError: true } : {}),
   };
@@ -69,7 +71,7 @@ function keywordApiPayload(args: Record<string, unknown>): Record<string, unknow
 }
 
 function relatedKeywordPayload(args: Record<string, unknown>): Record<string, unknown> {
-  const payload = keywordApiPayload(args);
+  const payload = keywordApiPayload({...args,with_history:args.with_history ?? false});
   if (payload.seed !== undefined && payload.keyword === undefined) {
     payload.keyword = payload.seed;
   }
@@ -108,20 +110,6 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: enhanceTools([
       {
-        name: "discover_keywords",
-        description: "Legacy alias for related keyword discovery. Returns paginated keyword metrics and monthly history.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            keyword: { type: "string", description: "Primary keyword seed." },
-            url: { type: "string", description: "Page URL seed." },
-            site: { type: "string", description: "Root domain seed." },
-            location: { type: "string", description: "Geo ID or ISO (e.g. 2840 or US)." },
-            language: { type: "string", description: "Language ID or code (e.g. 1000 or en)." },
-          },
-        },
-      },
-      {
         name: "get_keyword_metrics",
         description: "Get exact-match base metrics and 1-48 months of monthly history for one keyword.",
         inputSchema: {
@@ -141,10 +129,11 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
         inputSchema: {
           type: "object",
           properties: {
-            seed: { type: "string" },
+            with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
+              seed: { type: "string" },
             history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
             page: { type: "integer", minimum: 1, default: 1 },
-            page_size: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+            page_size: { type: "integer", minimum: 1, default: 100 },
             location: { type: "string" },
             language: { type: "string" },
             force: { type: "boolean" },
@@ -154,11 +143,12 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
       },
       {
         name: "bulk_keyword_metrics",
-        description: "Get exact-match base metrics and 1-48 months of history for up to 1,000 keywords.",
+        description: "Get all exact-match base metrics, automatically batched in groups of 1,000. Monthly history is disabled by default.",
         inputSchema: {
           type: "object",
           properties: {
-            keywords: { type: "array", minItems: 1, maxItems: 1000, items: { type: "string" } },
+              with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
+            keywords: { type: "array", minItems: 1, items: { type: "string" } },
             history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
             location: { type: "string" },
             language: { type: "string" },
@@ -172,7 +162,7 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
         inputSchema: {
           type: "object",
           properties: {
-            seeds: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" } },
+            seeds: { type: "array", minItems: 1, items: { type: "string" } },
             max_iterations: { type: "integer", minimum: 1, maximum: 10, default: 5 },
             min_search_volume: { type: "integer", minimum: 0, default: 0 },
             location_id: { type: "integer", default: 2840 },
@@ -185,12 +175,12 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
       },
       {
         name: "get_keyword_expansion_status",
-        description: "Poll an expansion task by task_id. Returns status, progress percent, depth, and keyword counts. Pass include_results=true only after the task has completed if you need the keyword rows.",
+        description: "Poll an expansion task by task_id. Returns status, progress percent, depth, and keyword counts. Complete result rows are included by default; set include_results=false only for a lightweight progress check.",
         inputSchema: {
           type: "object",
           properties: {
             task_id: { type: "integer" },
-            include_results: { type: "boolean", default: false },
+            include_results: { type: "boolean", default: true },
           },
           required: ["task_id"],
         },
@@ -261,23 +251,6 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
           properties: {},
         },
       },
-      {
-        name: "bulk_keyword_lookup",
-        description: "Bulk volume/CPC for up to 1,000 keywords.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            keywords: {
-              type: "array",
-              items: { type: "string" },
-              description: "List of keywords to analyze.",
-            },
-            location: { type: "string" },
-            language: { type: "string" },
-          },
-          required: ["keywords"],
-        },
-      },
     ]),
   }));
 
@@ -293,36 +266,28 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
 
     try {
       switch (name) {
-        case "discover_keywords": {
-          const payload = keywordApiPayload({
-            ...toolArgs,
-            keyword: toolArgs.keyword || toolArgs.seed,
-            page: toolArgs.page || 1,
-            page_size: toolArgs.page_size || 100,
-          });
-          const response = await axiosInstance.post("/api/v1/keywords/ideas", payload);
-          return toolResult(response.data);
-        }
         case "get_keyword_metrics": {
-          const response = await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs));
-          return toolResult(response.data);
+          const keywords = Array.isArray(toolArgs.keywords) ? toolArgs.keywords : [toolArgs.keyword || toolArgs.seed].filter(Boolean);
+          const data = await completeMetrics(keywords, async keywords => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}))).data);
+          return toolResult(data);
         }
         case "get_related_keywords": {
-          const response = await axiosInstance.post("/api/v1/keywords/ideas", relatedKeywordPayload(toolArgs));
+          const response = {data:await completePages(async page => (await axiosInstance.post("/api/v1/keywords/ideas", {...relatedKeywordPayload(toolArgs),page,page_size:1000})).data)};
           return toolResult(response.data);
         }
         case "bulk_keyword_metrics": {
           const keywords = Array.isArray(toolArgs.keywords) ? toolArgs.keywords : [];
-          if (keywords.length < 1 || keywords.length > 1000) {
-            throw new McpError(ErrorCode.InvalidParams, "keywords must contain 1 to 1,000 items");
+          if (keywords.length < 1) {
+            throw new McpError(ErrorCode.InvalidParams, "keywords must contain at least one item");
           }
-          const response = await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs));
-          return toolResult(response.data);
+
+          const data = await completeMetrics(keywords, async keywords => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}))).data);
+          return toolResult(data, false, name);
         }
         case "start_keyword_expansion": {
           const seeds = parseSeedList(toolArgs);
           if (seeds.length < 1) {
-            throw new McpError(ErrorCode.InvalidParams, "seeds must contain 1 to 20 keywords");
+            throw new McpError(ErrorCode.InvalidParams, "seeds must contain at least one keyword");
           }
           try {
             const response = await axiosInstance.post(
@@ -349,7 +314,7 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
           if (!Number.isInteger(taskId) || taskId < 1) {
             throw new McpError(ErrorCode.InvalidParams, "task_id must be a positive integer");
           }
-          const includeResults = toolArgs.include_results === true || toolArgs.include_results === "true";
+          const includeResults = toolArgs.include_results !== false && toolArgs.include_results !== "false";
           try {
             const response = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}`, {
               params: includeResults ? { sync_metrics: "1" } : { live: "1", kick: "1" },
@@ -406,10 +371,7 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
           if (params.brand === undefined) {
             throw new McpError(ErrorCode.InvalidParams, "brand is required (0 or 1)");
           }
-          const response = await axiosInstance.get(
-            `/api/v1/websites/${encodeURIComponent(domain)}/keywords`,
-            { params }
-          );
+          const response = {data:await completePages(async page => (await axiosInstance.get(`/api/v1/websites/${encodeURIComponent(domain)}/keywords`, {params:{...params,page,page_size:1000}})).data)};
           return toolResult(response.data);
         }
         case "get_keyword_details": {
@@ -422,10 +384,6 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
         }
         case "get_quota": {
           const response = await axiosInstance.get("/api/v1/auth/quota");
-          return toolResult(response.data);
-        }
-        case "bulk_keyword_lookup": {
-          const response = await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs));
           return toolResult(response.data);
         }
         default:

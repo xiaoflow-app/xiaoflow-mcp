@@ -1,3 +1,5 @@
+import { completeMetrics, completePages } from "./complete-results.js";
+import { keywordExport } from "./keyword-export.js";
 import { MCP_APP_HTML_WIDGET } from "./app-widget.js";
 import { formatXiaoFlowReport } from "./format-report.js";
 import {
@@ -27,7 +29,7 @@ import { enhanceTools, SERVER_INFO } from "./tool-quality.js";
 const sessionUiTracker = new Map<string, number>();
 
 function canShowUiForSession(sessionKey: string, toolName: string, args: Record<string, unknown>): boolean {
-  if (!KEYWORD_UI_TOOLS.has(toolName)) return false;
+  if (!KEYWORD_UI_TOOLS.has(toolName) || toolName.startsWith("bulk_keyword_")) return false;
 
   // Single keyword check: batch lookups (multiple keywords) do not display the single-keyword UI
   if (toolName === "get_keyword_metrics") {
@@ -55,7 +57,7 @@ function canShowUiForSession(sessionKey: string, toolName: string, args: Record<
 
 function toolResult(data: unknown, isError = false, toolName = "", attachUi = false) {
   const formattedText = isError ? JSON.stringify(data) : formatXiaoFlowReport(data, toolName);
-  const structured = data && typeof data === "object" ? (data as Record<string, unknown>) : { result: data };
+  const structured = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : { result: data };
 
   return {
     content: [{ type: "text" as const, text: formattedText }],
@@ -75,7 +77,6 @@ const KEYWORD_UI_TOOLS = new Set([
   "get_related_keywords",
   "discover_keywords",
   "bulk_keyword_metrics",
-  "bulk_keyword_lookup",
   "get_keyword_details",
 ]);
 
@@ -138,7 +139,7 @@ function keywordApiPayload(args: Record<string, unknown>): Record<string, unknow
 }
 
 function relatedKeywordPayload(args: Record<string, unknown>): Record<string, unknown> {
-  const payload = keywordApiPayload(args);
+  const payload = keywordApiPayload({...args,with_history:args.with_history ?? false});
   if (payload.seed !== undefined && payload.keyword === undefined) {
     payload.keyword = payload.seed;
   }
@@ -170,6 +171,22 @@ export class McpSession extends DurableObject {
     this._env = env;
   }
 
+  async alarm() { await this.ctx.storage.deleteAll(); }
+
+  private async bulkResult(data: unknown, name: string) {
+    const files = keywordExport(data, name);
+    const id = this._env.MCP_SESSION.newUniqueId();
+    const token = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+    const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+    const stored = await this._env.MCP_SESSION.get(id).fetch(new Request('https://mcp.xiaoflow.com/__store_export', {
+      method:'POST',body:JSON.stringify({ token,expiresAt,csv:files.csv,json:files.json }),headers:{'Content-Type':'application/json'},
+    }));
+    if (!stored.ok) throw new Error('Unable to save the complete export. Please retry.');
+    const exports = ['csv','json'].map(format => ({ format,url:`https://mcp.xiaoflow.com/exports/${id.toString()}/${token}.${format}`,row_count:files.rowCount,expires_at:new Date(expiresAt).toISOString() }));
+    const base = toolResult({ ...(data as object),row_count:files.rowCount,exports }, false, name);
+    return { ...base,content:[...base.content, {type:'text' as const,text:`Complete result: ${files.rowCount} rows. Download CSV: ${exports[0].url}\nDownload JSON (all metrics and history): ${exports[1].url}\nLinks expire in 24 hours. Save the downloaded file locally; never reconstruct only the visible chat rows.`},...exports.map(file => ({type:'resource_link' as const,uri:file.url,name:`${name}.${file.format}`,mimeType:file.format==='csv'?'text/csv':'application/json',description:`Complete ${files.rowCount}-row result; expires ${file.expires_at}`}))] };
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method;
@@ -178,6 +195,40 @@ export class McpSession extends DurableObject {
     console.log(`[DO ${this.ctx.id}] ${method} ${pathname} (Orig: ${url.pathname})`);
 
     const corsHeaders = getCorsHeaders(request);
+    // These paths are reachable only through the Worker binding, not public routing.
+    if (pathname === '/__store_export' && method === 'POST') {
+      const files = await request.json() as { token:string;expiresAt:number;csv:string;json:string };
+      if (!/^[a-f0-9]{64}$/.test(files.token) || files.expiresAt <= Date.now()) return new Response('Invalid export', {status:400});
+      const encoder = new TextEncoder();
+      const metadata: Record<string,unknown> = {token:files.token,expiresAt:files.expiresAt};
+      for (const format of ['csv','json'] as const) {
+        const bytes = encoder.encode(files[format]);
+        const count = Math.ceil(bytes.length / 64000); metadata[format] = count;
+        for (let i=0;i<count;i+=20) {
+          const chunks: Record<string,Uint8Array> = {};
+          for (let j=i;j<Math.min(i+20,count);j++) chunks[`${format}:${j}`]=bytes.slice(j*64000,(j+1)*64000);
+          await this.ctx.storage.put(chunks);
+        }
+      }
+      await this.ctx.storage.put('export', metadata);
+      await this.ctx.storage.setAlarm(files.expiresAt);
+      return new Response(null, {status:204});
+    }
+    if (pathname === '/__download_export' && (method === 'GET' || method === 'HEAD')) {
+      const metadata = await this.ctx.storage.get<{token:string;expiresAt:number;csv:number;json:number}>('export');
+      const format = url.searchParams.get('format');
+      if (!metadata || metadata.expiresAt <= Date.now() || metadata.token !== url.searchParams.get('token') || (format !== 'csv' && format !== 'json')) return new Response('Export not found or expired', {status:404});
+      let chunk = 0;
+      const storage = this.ctx.storage;
+      const stream = new ReadableStream<Uint8Array>({ async pull(controller) {
+        if (chunk >= metadata[format]) { controller.close(); return; }
+        const bytes = await storage.get<Uint8Array>(`${format}:${chunk++}`);
+        if (!bytes) {controller.error(new Error('Export unavailable'));return;}
+        controller.enqueue(bytes);
+      } });
+      return new Response(method === 'HEAD' ? null : stream, {headers:{'Content-Type':format==='csv'?'text/csv; charset=utf-8':'application/json; charset=utf-8','Content-Disposition':`attachment; filename="xiaoflow-keywords.${format}"`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+    }
+
 
     if (method === "OPTIONS" || method === "HEAD") {
       return new Response(null, { status: 204, headers: corsHeaders });
@@ -199,7 +250,7 @@ export class McpSession extends DurableObject {
     if (isSseHandshake) {
       const authHeader = request.headers.get("Authorization");
       let apiKey = request.headers.get("X-Xiaoflow-Api-Key") || url.searchParams.get("key") || "";
-      
+
       if (!apiKey && authHeader && authHeader.startsWith("Bearer ")) {
         apiKey = authHeader.substring(7);
       }
@@ -252,7 +303,7 @@ export class McpSession extends DurableObject {
                 clearInterval(intervalId);
               }
             }, 10000);
-            
+
           } catch (e) {
             console.error(`[DO ${sessionId}] SSE Start Error:`, e);
             controller.error(e);
@@ -290,9 +341,9 @@ export class McpSession extends DurableObject {
         if (storedKey) {
             this.server = this.createServerInstance(storedKey, this.ctx.id.toString());
         }
-        return new Response("Session state lost. Please reconnect SSE.", { 
-            status: 410, 
-            headers: { ...corsHeaders, "Content-Type": "text/plain" } 
+        return new Response("Session state lost. Please reconnect SSE.", {
+            status: 410,
+            headers: { ...corsHeaders, "Content-Type": "text/plain" }
         });
       }
 
@@ -328,13 +379,13 @@ export class McpSession extends DurableObject {
 
     // Health Check / Diagnostics
     if (pathname === "/health" || pathname === "/") {
-      return new Response(JSON.stringify({ 
-        status: "OK", 
+      return new Response(JSON.stringify({
+        status: "OK",
         sessionId: this.ctx.id.toString(),
         mcpVersion: "1.3.1-DO",
         timestamp: new Date().toISOString()
-      }), { 
-        headers: { ...corsHeaders, "Content-Type": "application/json" } 
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
@@ -368,20 +419,6 @@ export class McpSession extends DurableObject {
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: enhanceTools([
         {
-          name: "discover_keywords",
-          description: "Legacy alias for related keyword discovery. Returns paginated keyword metrics and monthly history.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              keyword: { type: "string", description: "Primary keyword seed." },
-              url: { type: "string", description: "Page URL seed." },
-              site: { type: "string", description: "Root domain seed." },
-              location: { type: "string", description: "Geo ID or ISO (e.g. 2840 or US)." },
-              language: { type: "string", description: "Language ID or code (e.g. 1000 or en)." },
-            },
-          },
-        },
-        {
           name: "get_keyword_metrics",
           description: "Get exact-match base metrics and 1-48 months of monthly history for one keyword.",
           inputSchema: {
@@ -401,10 +438,11 @@ export class McpSession extends DurableObject {
           inputSchema: {
             type: "object",
             properties: {
+              with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
               seed: { type: "string", description: "Seed keyword." },
               history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
               page: { type: "integer", minimum: 1, default: 1 },
-              page_size: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+              page_size: { type: "integer", minimum: 1, default: 100 },
               location: { type: "string" },
               language: { type: "string" },
               force: { type: "boolean", description: "Request fresh discovery when cached coverage is insufficient." },
@@ -414,11 +452,12 @@ export class McpSession extends DurableObject {
         },
         {
           name: "bulk_keyword_metrics",
-          description: "Get exact-match base metrics and 1-48 months of history for up to 1,000 keywords in one request.",
+          description: "Get complete exact-match metrics, automatically batched in groups of 1,000. Monthly history is omitted by default; set with_history=true to include it.",
           inputSchema: {
             type: "object",
             properties: {
-              keywords: { type: "array", minItems: 1, maxItems: 1000, items: { type: "string" } },
+              with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
+              keywords: { type: "array", minItems: 1, items: { type: "string" } },
               history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
               location: { type: "string" },
               language: { type: "string" },
@@ -432,7 +471,7 @@ export class McpSession extends DurableObject {
           inputSchema: {
             type: "object",
             properties: {
-              seeds: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" } },
+              seeds: { type: "array", minItems: 1, items: { type: "string" } },
               max_iterations: { type: "integer", minimum: 1, maximum: 10, default: 5 },
               min_search_volume: { type: "integer", minimum: 0, default: 0 },
               location_id: { type: "integer", default: 2840 },
@@ -453,12 +492,12 @@ export class McpSession extends DurableObject {
         },
         {
           name: "get_keyword_expansion_status",
-          description: "Poll an expansion task by task_id. Returns status (pending/processing/completed/failed), progress percent, depth, and keyword counts. Pass include_results=true only after the task has completed if you need the keyword rows.",
+          description: "Poll an expansion task by task_id. Returns status (pending/processing/completed/failed), progress percent, depth, and keyword counts. Complete result rows are included by default; set include_results=false only for a lightweight progress check.",
           inputSchema: {
             type: "object",
             properties: {
               task_id: { type: "integer" },
-              include_results: { type: "boolean", default: false },
+              include_results: { type: "boolean", default: true },
             },
             required: ["task_id"],
           },
@@ -521,23 +560,6 @@ export class McpSession extends DurableObject {
             required: ["slug"],
           },
         },
-        {
-          name: "bulk_keyword_lookup",
-          description: "Bulk volume/CPC for up to 1,000 keywords.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              keywords: { 
-                type: "array", 
-                items: { type: "string" },
-                description: "List of keywords to analyze."
-              },
-              location: { type: "string" },
-              language: { type: "string" },
-            },
-            required: ["keywords"],
-          },
-        },
       ]),
     }));
 
@@ -557,30 +579,9 @@ export class McpSession extends DurableObject {
       _meta: widgetUiMeta(true),
     };
 
-    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: [resourceDef],
-    }));
-
-    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
-      resourceTemplates: [templateDef],
-    }));
-
-    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const uri = String(request.params.uri || "");
-      if (uri.startsWith("ui://xiaoflow/keyword-dashboard") || uri.includes("keyword-dashboard")) {
-        return {
-          contents: [
-            {
-              uri: uri || WIDGET_URI,
-              mimeType: "text/html;profile=mcp-app",
-              text: MCP_APP_HTML_WIDGET,
-              _meta: widgetUiMeta(true),
-            },
-          ],
-        };
-      }
-      throw new McpError(ErrorCode.InvalidRequest, `Resource not found: ${request.params.uri}`);
-    });
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({resources:[]}));
+    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({resourceTemplates:[]}));
+    server.setRequestHandler(ReadResourceRequestSchema, async () => { throw new McpError(ErrorCode.InvalidRequest, "Use the complete JSON data and CSV/JSON download resources returned by the tool."); });
     server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -589,74 +590,31 @@ export class McpSession extends DurableObject {
       const effectiveKey = ((toolArgs.api_key as string) || (toolArgs.apiKey as string) || apiKey || "").trim();
       const reqConfig = effectiveKey ? { headers: { Authorization: `Bearer ${effectiveKey}` } } : {};
       const effectiveSessionKey = String((toolArgs.session_id as string) || (toolArgs.sessionId as string) || sessionKey || effectiveKey || "default").trim();
-      const attachUi = canShowUiForSession(effectiveSessionKey, name, toolArgs);
+      const attachUi = false;
       try {
         switch (name) {
-          case "discover_keywords": {
-            const payload = keywordApiPayload({
-              ...toolArgs,
-              keyword: toolArgs.keyword || toolArgs.seed,
-              page: toolArgs.page || 1,
-              page_size: toolArgs.page_size || 100,
-            });
-            const response = await axiosInstance.post("/api/v1/keywords/ideas", payload, reqConfig);
-            return toolResult(response.data, false, name, attachUi);
-          }
           case "get_keyword_metrics": {
-            const rawKw = toolArgs.keywords || toolArgs.keyword || toolArgs.seed || [];
-            const kwList = Array.isArray(rawKw) ? rawKw : [rawKw];
-            const primaryKw = String(kwList[0] || "").trim();
-
-            const batchPromise = axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs), reqConfig);
-
-            // When querying a single target keyword, also fetch related keyword ideas so the interactive UI dashboard and report contain both the primary keyword metrics and rich related keyword opportunities!
-            if (kwList.length <= 1 && primaryKw) {
-              const ideasPromise = axiosInstance.post("/api/v1/keywords/ideas", keywordApiPayload({
-                ...toolArgs,
-                keyword: primaryKw,
-                page: 1,
-                page_size: 100,
-              }), reqConfig).catch(() => null);
-
-              const [batchRes, ideasRes] = await Promise.all([batchPromise, ideasPromise]);
-              const batchData = batchRes.data?.data || (Array.isArray(batchRes.data) ? batchRes.data : []);
-              const ideasData = ideasRes?.data?.data || (Array.isArray(ideasRes?.data) ? ideasRes?.data : []);
-
-              if (ideasData.length > 0) {
-                const mergedMap = new Map();
-                for (const item of batchData) {
-                  const k = String(item.keyword || item.k || "").toLowerCase();
-                  if (k) mergedMap.set(k, item);
-                }
-                for (const item of ideasData) {
-                  const k = String(item.keyword || item.k || "").toLowerCase();
-                  if (k && !mergedMap.has(k)) mergedMap.set(k, item);
-                }
-                const mergedList = Array.from(mergedMap.values());
-                return toolResult({ ...(batchRes.data || {}), data: mergedList }, false, name, attachUi);
-              }
-              return toolResult(batchRes.data, false, name, attachUi);
-            }
-
-            const response = await batchPromise;
-            return toolResult(response.data, false, name, attachUi);
+            const keywords = Array.isArray(toolArgs.keywords) ? toolArgs.keywords : [toolArgs.keyword || toolArgs.seed].filter(Boolean);
+            const data = await completeMetrics(keywords, async keywords => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}),reqConfig)).data);
+            return toolResult(data,false,name);
           }
           case "get_related_keywords": {
-            const response = await axiosInstance.post("/api/v1/keywords/ideas", relatedKeywordPayload(toolArgs), reqConfig);
+            const response = {data:await completePages(async page => (await axiosInstance.post("/api/v1/keywords/ideas", {...relatedKeywordPayload(toolArgs),page,page_size:1000},reqConfig)).data)};
             return toolResult(response.data, false, name, attachUi);
           }
           case "bulk_keyword_metrics": {
             const keywords = Array.isArray(toolArgs.keywords) ? toolArgs.keywords : [];
-            if (keywords.length < 1 || keywords.length > 1000) {
-              throw new McpError(ErrorCode.InvalidParams, "keywords must contain 1 to 1,000 items");
+            if (keywords.length < 1) {
+              throw new McpError(ErrorCode.InvalidParams, "keywords must contain at least one item");
             }
-            const response = await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs));
-            return toolResult(response.data, false, name, attachUi);
+
+            const data = await completeMetrics(keywords, async keywords => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}))).data);
+            return this.bulkResult(data, name);
           }
           case "start_keyword_expansion": {
             const seeds = parseSeedList(toolArgs);
             if (seeds.length < 1) {
-              throw new McpError(ErrorCode.InvalidParams, "seeds must contain 1 to 20 keywords");
+              throw new McpError(ErrorCode.InvalidParams, "seeds must contain at least one keyword");
             }
             try {
               const res = await axiosInstance.post(
@@ -692,7 +650,7 @@ export class McpSession extends DurableObject {
             if (!Number.isInteger(taskId) || taskId < 1) {
               throw new McpError(ErrorCode.InvalidParams, "task_id must be a positive integer");
             }
-            const includeResults = toolArgs.include_results === true || toolArgs.include_results === "true";
+            const includeResults = toolArgs.include_results !== false && toolArgs.include_results !== "false";
             try {
               const res = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}`, {
                 params: includeResults ? { sync_metrics: "1" } : { live: "1", kick: "1" },
@@ -750,10 +708,7 @@ export class McpSession extends DurableObject {
             if (params.brand === undefined) {
               throw new McpError(ErrorCode.InvalidParams, "brand is required (0 or 1)");
             }
-            const response = await axiosInstance.get(
-              `/api/v1/websites/${encodeURIComponent(domain)}/keywords`,
-              { params }
-            );
+            const response = {data:await completePages(async page => (await axiosInstance.get(`/api/v1/websites/${encodeURIComponent(domain)}/keywords`, {params:{...params,page,page_size:1000}})).data)};
             return toolResult(response.data, false, name, attachUi);
           }
           case "get_keyword_details": {
@@ -762,10 +717,6 @@ export class McpSession extends DurableObject {
               ...rest,
               keyword: String(slug).replace(/-/g, " "),
             }));
-            return toolResult(response.data, false, name, attachUi);
-          }
-          case "bulk_keyword_lookup": {
-            const response = await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload(toolArgs));
             return toolResult(response.data, false, name, attachUi);
           }
           default:
@@ -1306,6 +1257,14 @@ export default {
             return new Response(null, { status: 204, headers: getCorsHeaders(request) });
         }
 
+        const exportPath = url.pathname.match(/^\/exports\/([a-f0-9]{64})\/([a-f0-9]{64})\.(csv|json)$/);
+        if (exportPath && (method === 'GET' || method === 'HEAD')) {
+            try {
+                const id = env.MCP_SESSION.idFromString(exportPath[1]);
+                return env.MCP_SESSION.get(id).fetch(new Request(`https://mcp.xiaoflow.com/__download_export?token=${exportPath[2]}&format=${exportPath[3]}`, {method}));
+            } catch { return new Response('Export not found', {status:404}); }
+        }
+
         const isMcp = pathname === "/mcp";
         const isSse = pathname === "/sse";
         const isMessages = pathname === "/messages";
@@ -1346,7 +1305,7 @@ export default {
             const baseUrl = `${url.protocol}//${url.host}`;
             const newRequest = new Request(request);
             newRequest.headers.set("X-External-Base-Url", baseUrl);
-            
+
             return obj.fetch(newRequest);
         }
 

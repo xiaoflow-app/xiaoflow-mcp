@@ -3,7 +3,7 @@ export type ExpansionArgs = Record<string, unknown>;
 export function parseSeedList(args: ExpansionArgs): string[] {
   const raw = args.seeds ?? args.seed ?? args.keyword ?? [];
   const list = Array.isArray(raw) ? raw : [raw];
-  return list.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 20);
+  return list.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
 export function parseSeedsField(raw: unknown): string[] {
@@ -87,6 +87,7 @@ export function normalizeExpansionStatus(
   const progressObj = progress && typeof progress === "object" ? progress as Record<string, unknown> : {};
   const status = String(task.status || "pending");
   const payload: Record<string, unknown> = {
+    ...task,
     success: true,
     task_id: Number(task.id ?? taskId),
     status,

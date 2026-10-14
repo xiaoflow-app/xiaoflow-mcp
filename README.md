@@ -133,17 +133,14 @@ For stdio-only clients, bridge to the OAuth-enabled remote endpoint:
 | :--- | :--- | :--- |
 | `get_keyword_metrics` | Exact metrics and monthly history for one keyword | `keyword`, `history_months` (1–48), `location`, `language` |
 | `get_related_keywords` | Related keywords with metrics/history and unlimited pagination | `seed`, `history_months`, `page`, `page_size` (max 1,000) |
-| `bulk_keyword_metrics` | Exact metrics/history for up to 1,000 keywords | `keywords`, `history_months`, `location`, `language` |
+| `bulk_keyword_metrics` | Complete exact metrics, automatically batched in groups of 1,000 | `keywords`, `with_history` (default false), `history_months`, `location`, `language` |
 | `start_keyword_expansion` | Start round-based expansion from one or more seeds | `seeds`, `max_iterations`, include/exclude rules |
 | `get_keyword_expansion_status` | Poll an expansion task and retrieve results | `task_id`, `include_results` |
 | `analyze_url` | Analyze page or domain search visibility | `url`, `site`, `brand`, `location`, `language` |
 | `get_domain_stats` | Overview search metrics & traffic trends for a domain | `domain`, `brand` (required: `0`=domain, `1`=brand) |
 | `list_domain_keywords` | Retrieve paginated list of domain keywords | `domain`, `brand`, `page`, `page_size` |
 | `get_keyword_details` | Retrieve keyword metrics for a 12, 24, or 48 month window | `slug`, `time_range`, `location`, `language` |
-| `discover_keywords` | Backward-compatible related keyword discovery | `keyword`, `url`, `site`, `location`, `language` |
-| `bulk_keyword_lookup` | Backward-compatible bulk metrics lookup | `keywords`, `location`, `language` |
 
-Legacy aliases remain available for backward compatibility.
 
 Every tool publishes:
 
@@ -226,3 +223,18 @@ or customer data in public issues.
 ## 📄 License
 
 MIT © [XiaoFlow](https://www.xiaoflow.com)
+
+### Complete bulk results and files
+
+`bulk_keyword_metrics` return all queried rows (up to 1,000 per request), rather than a 12-row report preview. Hosted MCP responses include CSV and JSON resource links plus `structuredContent.exports`. Download links are unguessable, valid for 24 hours, and return an attachment without requiring a separate API query. Historical trends are disabled by default; set `with_history: true` to request them. CSV contains the requested keyword metrics; JSON preserves the entire original result. Save the download itself to keep every row, regardless of the chat client's display limits.
+
+The stdio server returns the full structured result and embedded `text/csv` and `application/json` resources, which clients can save locally. A remote MCP server cannot choose a path on your computer; the client saves the downloaded/resource file at your chosen location.
+
+Regression checks: `npm run build && node --test tests/keyword-export.test.mjs`. To exercise hosted export storage and downloads locally, run Wrangler on port 8799 with `XIAOFLOW_API_URL=http://127.0.0.1:8899`, then `node tests/worker-export.integration.mjs`.
+
+MCP results are now raw JSON, without chart images or dashboard widgets. Bulk
+metrics have no MCP total-keyword ceiling: requests are split into API batches,
+and discovery/domain keyword listings follow every reported result page.
+Exports preserve all rows, monthly histories and additional metric fields. The
+previous 8 MB export cap is removed. Upstream data availability, account credits
+and platform transport/storage limits still apply; these are not silently bypassed.
