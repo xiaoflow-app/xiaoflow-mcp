@@ -79,13 +79,6 @@ function bulkMetricsResult(
   return {
     content: [
       { type: "text" as const, text: formatBulkMetricsText(payload) },
-      ...exports.map((file) => ({
-        type: "resource_link" as const,
-        uri: file.url,
-        name: `${toolName}.${file.format}`,
-        mimeType: file.format === "csv" ? "text/csv" : "application/json",
-        description: `Complete ${file.row_count}-row result saved on disk`,
-      })),
     ],
     structuredContent: payload,
   };
@@ -566,13 +559,6 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
             return {
               content: [
                 { type: "text" as const, text: formatExpansionCompleteText(payload) },
-                ...exports.map((file) => ({
-                  type: "resource_link" as const,
-                  uri: file.url,
-                  name: `${name}.${file.format}`,
-                  mimeType: file.format === "csv" ? "text/csv" : "application/json",
-                  description: `Complete ${file.row_count}-row result saved on disk`,
-                })),
               ],
               structuredContent: payload,
             };

@@ -216,13 +216,6 @@ export class McpSession extends DurableObject {
     return {
       content: [
         { type: 'text' as const, text },
-        ...exports.map(file => ({
-          type: 'resource_link' as const,
-          uri: file.url,
-          name: `${name}.${file.format}`,
-          mimeType: file.format === 'csv' ? 'text/csv' : 'application/json',
-          description: `Complete ${files.rowCount}-row result; expires ${file.expires_at}`,
-        })),
       ],
       structuredContent: payload,
     };
@@ -907,7 +900,6 @@ export class McpSession extends DurableObject {
               return {
                 content: [
                   { type: "text" as const, text: formatExpansionCompleteText(payload) },
-                  ...this.exportResourceLinks(exports, name),
                 ],
                 structuredContent: payload,
               };
