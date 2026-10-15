@@ -191,18 +191,21 @@ function createXiaoflowServer(apiKey: string, apiUrl: string): Server {
       },
       {
         name: "bulk_keyword_metrics",
-        description: `Look up exact-match metrics for keywords. Returns complete keyword metrics (volume, CPC, competition) directly in structured data and preview tables. Supports lists of any size: ≤${BULK_SYNC_LIMIT} keywords run synchronously; larger lists create a background task that can be polled and paginated via get_bulk_keyword_lookup_status. History off by default.`,
+        description: `Look up exact-match search volume, CPC, and competition for keyword lists. Supports up to ${BULK_SYNC_LIMIT} keywords synchronously (larger lists run as a background task). Complete results are returned in structured data and downloadable CSV/JSON files.
+GUIDANCE FOR AI AGENTS:
+- Do NOT split keyword lists into small 50-word batches; pass up to ${BULK_SYNC_LIMIT} keywords in one call.
+- Do NOT output exhaustive markdown tables repeating hundreds of keywords in chat; summarize findings, volume distribution bands, and refer the user to the download links.`,
         inputSchema: {
           type: "object",
           properties: {
-            with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
-            keywords: { type: "array", minItems: 1, items: { type: "string" }, description: `Keywords to analyze. Any size; >${BULK_SYNC_LIMIT} becomes a background task.` },
+            with_history: { type: "boolean", default: false, description: "Include 12-48 month historical search volume (default false for speed)." },
+            keywords: { type: "array", minItems: 1, items: { type: "string" }, description: `Keywords to analyze. Pass up to ${BULK_SYNC_LIMIT} in a single call without manual chunking.` },
             history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
-            location: { type: "string" },
-            language: { type: "string" },
-            min_volume: { type: "integer", minimum: 0, description: "Optional filter for minimum volume." },
-            max_volume: { type: "integer", minimum: 0, description: "Optional filter for maximum volume (e.g. 100 to list low-volume terms)." },
-            preview_limit: { type: "integer", minimum: 0, maximum: 1000, default: 100, description: "How many keyword rows to include in the chat summary." },
+            location: { type: "string", description: "Google Ads geo target ID (e.g. 2840 for US) or country code." },
+            language: { type: "string", description: "Google Ads language ID (e.g. 1000 for English) or language code." },
+            min_volume: { type: "integer", minimum: 0, description: "Filter results by minimum monthly search volume." },
+            max_volume: { type: "integer", minimum: 0, description: "Filter results by maximum monthly search volume (e.g. 99 for low-volume terms)." },
+            preview_limit: { type: "integer", minimum: 0, maximum: 50, default: 15, description: "Number of rows to show in chat preview table (default 15, max 50). Full list is in downloads." },
             force_async: { type: "boolean", default: false, description: "Force background task even for small lists." },
           },
           required: ["keywords"],

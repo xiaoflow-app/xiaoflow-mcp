@@ -34,10 +34,10 @@ type ToolDefinition = {
 
 const PARAMETER_DESCRIPTIONS: Record<string, string> = {
   keyword: "Exact keyword or seed phrase to research.",
-  keywords: "Keywords to analyze; any size (large lists become background tasks).",
+  keywords: "Keywords to analyze. Pass up to 2,000 keywords in a single call without manual batching (larger lists become background tasks).",
   min_volume: "Optional minimum monthly search volume for summary filtering.",
   max_volume: "Optional maximum monthly search volume for low-volume filter hits.",
-  preview_limit: "How many preview / filter-hit rows to include in the chat summary (0–1000).",
+  preview_limit: "How many preview rows to include in the chat summary (default 15, max 50). Full list is in downloads.",
   force_async: "When true, always create a background bulk-lookup task.",
   seed: "Seed keyword used to discover related search terms.",
   seeds: "One to 20 seed keywords used as expansion starting points.",
