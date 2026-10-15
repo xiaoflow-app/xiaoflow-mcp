@@ -34,7 +34,11 @@ type ToolDefinition = {
 
 const PARAMETER_DESCRIPTIONS: Record<string, string> = {
   keyword: "Exact keyword or seed phrase to research.",
-  keywords: "Keywords to analyze; accepts up to 1,000 unique phrases.",
+  keywords: "Keywords to analyze; any size (large lists become background tasks).",
+  min_volume: "Optional minimum monthly search volume for summary filtering.",
+  max_volume: "Optional maximum monthly search volume for low-volume filter hits.",
+  preview_limit: "How many preview / filter-hit rows to include in the chat summary (0–1000).",
+  force_async: "When true, always create a background bulk-lookup task.",
   seed: "Seed keyword used to discover related search terms.",
   seeds: "One to 20 seed keywords used as expansion starting points.",
   url: "Fully qualified page URL used as a keyword discovery seed.",
@@ -48,21 +52,24 @@ const PARAMETER_DESCRIPTIONS: Record<string, string> = {
   language_id: "Google Ads numeric language ID; 1000 represents English.",
   history_months: "Number of monthly history points to return, from 1 through 48.",
   time_range: "Historical window to return: 12m, 24m, or 48m.",
-  page: "One-based result page number.",
-  page_size: "Number of results per page; maximum 1,000.",
+  page: "One-based result page number (up to 1,000 keywords per page).",
+  page_size: "Number of results per page (up to 1,000 keywords).",
+  all_pages: "When true, automatically fetch all result pages if task has <= 2,000 rows.",
   force: "When true, request a live refresh instead of relying only on cached data.",
   max_iterations: "Maximum breadth-first expansion rounds, from 1 through 10.",
   min_search_volume: "Exclude discovered keywords below this monthly search volume.",
   include_rules: "Optional text rules; results must match at least one supplied rule.",
   exclude_rules: "Optional text rules; matching results are removed.",
-  task_id: "Numeric task identifier returned by start_keyword_expansion.",
-  include_results: "When true, include accumulated expansion results with task status.",
+  task_id: "Numeric task identifier returned by start_keyword_expansion or bulk_keyword_metrics.",
+  include_results: "When true, include discovered keyword objects in the structured response.",
+  live: "When true, nudge background task runner and return current progress / discovered keywords.",
 };
 
 const TITLES: Record<string, string> = {
   get_keyword_metrics: "Get Keyword Metrics",
   get_related_keywords: "Get Related Keywords",
   bulk_keyword_metrics: "Get Bulk Keyword Metrics",
+  get_bulk_keyword_lookup_status: "Get Bulk Keyword Lookup Status",
   start_keyword_expansion: "Start Keyword Expansion",
   get_keyword_expansion_status: "Get Keyword Expansion Status",
   get_quota: "Get Account Balance & Quota",
@@ -134,13 +141,18 @@ const expansionStartOutput: JsonSchema = {
 
 const expansionStatusOutput: JsonSchema = {
   type: "object",
-  description: "Current state and optional results for an expansion task.",
+  description: "Current state and discovered keyword results for an expansion task.",
   properties: {
     success: { type: "boolean", description: "Whether task status was retrieved." },
     task_id: { type: "integer", description: "Expansion task identifier." },
     status: { type: "string", description: "queued, running, completed, or failed." },
     progress: { type: "number", description: "Completion percentage from 0 to 100." },
-    results: { type: "array", description: "Accumulated keyword results when requested.", items: keywordSchema },
+    data: { type: "array", description: "Discovered keyword results.", items: keywordSchema },
+    results: { type: "array", description: "Discovered keyword results (alias for data).", items: keywordSchema },
+    total: { type: "integer", description: "Total discovered keywords." },
+    page: { type: "integer", description: "Current result page number." },
+    page_size: { type: "integer", description: "Results per page." },
+    has_more: { type: "boolean", description: "Whether additional result pages exist." },
     error: { type: "string", description: "Task or request failure description." },
   },
   required: ["success"],
@@ -167,6 +179,7 @@ const OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
   get_keyword_metrics: keywordListOutput,
   get_related_keywords: keywordListOutput,
   bulk_keyword_metrics: keywordListOutput,
+  get_bulk_keyword_lookup_status: keywordListOutput,
   start_keyword_expansion: expansionStartOutput,
   get_keyword_expansion_status: expansionStatusOutput,
   get_quota: quotaOutputSchema,
@@ -187,7 +200,12 @@ export function enhanceTools(tools: ToolDefinition[]): ToolDefinition[] {
         },
       ]),
     );
-    const mutates = tool.name === "start_keyword_expansion";
+    const mutates = tool.name === "start_keyword_expansion" || tool.name === "bulk_keyword_metrics";
+    const bulkCompact =
+      tool.name === "bulk_keyword_metrics" ||
+      tool.name === "get_bulk_keyword_lookup_status" ||
+      tool.name === "start_keyword_expansion" ||
+      tool.name === "get_keyword_expansion_status";
     const showKeywordUi = false;
     const widgetCsp = {
       connectDomains: ["https://api.xiaoflow.com", "https://mcp.xiaoflow.com", "https://www.xiaoflow.com"],
@@ -210,7 +228,9 @@ export function enhanceTools(tools: ToolDefinition[]): ToolDefinition[] {
             "openai/outputTemplate": "ui://xiaoflow/keyword-dashboard-v3",
           }
         : {},
-      description: tool.description + " Returns complete raw JSON data with all returned rows and fields, without charts or dashboard formatting. Bulk queries accept any number of keywords and automatically split API requests. Keyword discovery automatically fetches all result pages. Preserve every row and history value; use CSV/JSON resources to save results instead of reconstructing a chat preview.",
+      description: bulkCompact
+        ? tool.description
+        : tool.description + " Returns complete raw JSON data with all returned rows and fields, without charts or dashboard formatting. Keyword discovery automatically fetches all result pages. Preserve every row and history value; use CSV/JSON resources to save results instead of reconstructing a chat preview.",
       inputSchema: { ...tool.inputSchema, properties },
       outputSchema: { type:"object", additionalProperties:true },
       annotations: {

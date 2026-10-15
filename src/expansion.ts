@@ -74,21 +74,23 @@ export function normalizeStartedTask(data: Record<string, unknown> | undefined, 
     seeds,
     keywords_count: 0,
     url: `https://www.xiaoflow.com/user/discovery?task=${taskId}`,
-    next_action: `Call get_keyword_expansion_status with task_id=${taskId} until status is completed, processed, or failed. Do not treat related-keyword lists as this task.`,
+    mode: "background_task",
+    next_action: `Call get_keyword_expansion_status with task_id=${taskId} until status is completed, processed, or failed. Do not reprint keyword rows in chat — download CSV/JSON when the status tool returns exports.`,
   };
 }
 
+/** Compact status only — never attach full result rows (use exports instead). */
 export function normalizeExpansionStatus(
   task: Record<string, unknown>,
   taskId: number,
-  includeResults: boolean,
+  _includeResults = false,
 ): Record<string, unknown> {
   const progress = task.progress;
   const progressObj = progress && typeof progress === "object" ? progress as Record<string, unknown> : {};
   const status = String(task.status || "pending");
   const payload: Record<string, unknown> = {
-    ...task,
     success: true,
+    mode: "background_task",
     task_id: Number(task.id ?? taskId),
     status,
     progress: progressPercent(progress, 0),
@@ -98,13 +100,12 @@ export function normalizeExpansionStatus(
     max_iterations: progressObj.max_iterations ?? null,
     pending_count: task.pending_count ?? progressObj.pending_count ?? 0,
     processed_count: task.processed_count ?? progressObj.processed_count ?? 0,
+    results_total: task.results_total ?? task.found_keywords_count ?? 0,
+    results_truncated: Boolean(task.results_truncated),
     url: `https://www.xiaoflow.com/user/discovery?task=${task.id ?? taskId}`,
   };
   if (task.error) {
     payload.error = task.error;
-  }
-  if (includeResults && Array.isArray(task.results)) {
-    payload.results = task.results;
   }
   return payload;
 }

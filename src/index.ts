@@ -1,11 +1,24 @@
 import { completeMetrics, completePages } from "./complete-results.js";
 import { keywordExport } from "./keyword-export.js";
+import {
+  BULK_SYNC_LIMIT,
+  buildBulkMetricsResponse,
+  formatBulkMetricsText,
+  formatBulkTaskText,
+  type BulkExportLink,
+} from "./bulk-response.js";
+import {
+  buildExpansionCompleteResponse,
+  compactExpansionStatus,
+  formatExpansionCompleteText,
+  formatExpansionTaskText,
+  isExpansionTerminal,
+} from "./expansion-response.js";
 import { MCP_APP_HTML_WIDGET } from "./app-widget.js";
 import { formatXiaoFlowReport } from "./format-report.js";
 import {
   axiosErrorMessage,
   expansionStartPayload,
-  normalizeExpansionStatus,
   normalizeStartedTask,
   parseSeedList,
 } from "./expansion.js";
@@ -173,18 +186,56 @@ export class McpSession extends DurableObject {
 
   async alarm() { await this.ctx.storage.deleteAll(); }
 
-  private async bulkResult(data: unknown, name: string) {
-    const files = keywordExport(data, name);
+  private async storeExportFiles(csv: string, json: string, rowCount: number, name: string): Promise<BulkExportLink[]> {
     const id = this._env.MCP_SESSION.newUniqueId();
     const token = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
     const stored = await this._env.MCP_SESSION.get(id).fetch(new Request('https://mcp.xiaoflow.com/__store_export', {
-      method:'POST',body:JSON.stringify({ token,expiresAt,csv:files.csv,json:files.json }),headers:{'Content-Type':'application/json'},
+      method: 'POST',
+      body: JSON.stringify({ token, expiresAt, csv, json }),
+      headers: { 'Content-Type': 'application/json' },
     }));
     if (!stored.ok) throw new Error('Unable to save the complete export. Please retry.');
-    const exports = ['csv','json'].map(format => ({ format,url:`https://mcp.xiaoflow.com/exports/${id.toString()}/${token}.${format}`,row_count:files.rowCount,expires_at:new Date(expiresAt).toISOString() }));
-    const base = toolResult({ ...(data as object),row_count:files.rowCount,exports }, false, name);
-    return { ...base,content:[...base.content, {type:'text' as const,text:`Complete result: ${files.rowCount} rows. Download CSV: ${exports[0].url}\nDownload JSON (all metrics and history): ${exports[1].url}\nLinks expire in 24 hours. Save the downloaded file locally; never reconstruct only the visible chat rows.`},...exports.map(file => ({type:'resource_link' as const,uri:file.url,name:`${name}.${file.format}`,mimeType:file.format==='csv'?'text/csv':'application/json',description:`Complete ${files.rowCount}-row result; expires ${file.expires_at}`}))] };
+    return ['csv', 'json'].map(format => ({
+      format,
+      url: `https://mcp.xiaoflow.com/exports/${id.toString()}/${token}.${format}`,
+      row_count: rowCount,
+      expires_at: new Date(expiresAt).toISOString(),
+    }));
+  }
+
+  private async bulkResult(
+    data: unknown,
+    name: string,
+    opts: { min_volume?: number; max_volume?: number; preview_limit?: number } = {},
+  ) {
+    const files = keywordExport(data, name);
+    const exports = await this.storeExportFiles(files.csv, files.json, files.rowCount, name);
+    const payload = buildBulkMetricsResponse(data, name, exports, opts);
+    const text = formatBulkMetricsText(payload);
+    return {
+      content: [
+        { type: 'text' as const, text },
+        ...exports.map(file => ({
+          type: 'resource_link' as const,
+          uri: file.url,
+          name: `${name}.${file.format}`,
+          mimeType: file.format === 'csv' ? 'text/csv' : 'application/json',
+          description: `Complete ${files.rowCount}-row result; expires ${file.expires_at}`,
+        })),
+      ],
+      structuredContent: payload,
+    };
+  }
+
+  private exportResourceLinks(exports: BulkExportLink[], name: string) {
+    return exports.map(file => ({
+      type: 'resource_link' as const,
+      uri: file.url,
+      name: `${name}.${file.format}`,
+      mimeType: file.format === 'csv' ? 'text/csv' : 'application/json',
+      description: `Complete ${file.row_count}-row result; expires ${file.expires_at}`,
+    }));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -452,22 +503,42 @@ export class McpSession extends DurableObject {
         },
         {
           name: "bulk_keyword_metrics",
-          description: "Get complete exact-match metrics, automatically batched in groups of 1,000. Monthly history is omitted by default; set with_history=true to include it.",
+          description: `Look up exact-match metrics for keywords. Returns complete keyword metrics (volume, CPC, competition) directly in structured data and preview tables. Supports lists of any size: ≤${BULK_SYNC_LIMIT} keywords run synchronously; larger lists create a background task that can be polled and paginated via get_bulk_keyword_lookup_status. History off by default.`,
           inputSchema: {
             type: "object",
             properties: {
               with_history: { type: "boolean", default: false, description: "Include monthly history only when explicitly true." },
-              keywords: { type: "array", minItems: 1, items: { type: "string" } },
+              keywords: { type: "array", minItems: 1, items: { type: "string" }, description: "Keywords to analyze. Any size; >"+BULK_SYNC_LIMIT+" becomes a background task." },
               history_months: { type: "integer", minimum: 1, maximum: 48, default: 12 },
               location: { type: "string" },
               language: { type: "string" },
+              min_volume: { type: "integer", minimum: 0, description: "Optional filter for minimum volume." },
+              max_volume: { type: "integer", minimum: 0, description: "Optional filter for maximum volume (e.g. 100 to list low-volume terms)." },
+              preview_limit: { type: "integer", minimum: 0, maximum: 1000, default: 100, description: "How many keyword rows to include in the chat summary." },
+              force_async: { type: "boolean", default: false, description: "Force background task even for small lists." },
             },
             required: ["keywords"],
           },
         },
         {
+          name: "get_bulk_keyword_lookup_status",
+          description: "Poll a background bulk_keyword_metrics task. When processing, returns progress. When completed, returns complete keyword metrics with pagination support (up to 1,000 keywords per page), volume filtering, and CSV/JSON download links.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              task_id: { type: "integer", description: "Task id from bulk_keyword_metrics when mode=background_task." },
+              page: { type: "integer", minimum: 1, default: 1, description: "Result page (1-based, up to 1,000 keywords per page)." },
+              page_size: { type: "integer", minimum: 1, maximum: 1000, default: 1000, description: "Number of keyword rows per page (max 1000)." },
+              min_volume: { type: "integer", minimum: 0, description: "Filter results by minimum search volume." },
+              max_volume: { type: "integer", minimum: 0, description: "Filter results by maximum search volume (e.g. 100 to extract low-volume terms)." },
+              all_pages: { type: "boolean", default: false, description: "Fetch all result pages if task has <= 2,000 rows." },
+            },
+            required: ["task_id"],
+          },
+        },
+        {
           name: "start_keyword_expansion",
-          description: "Start an asynchronous multi-round keyword expansion. Returns task_id and status only — never a related-keyword list. Poll get_keyword_expansion_status until completed/processed/failed.",
+          description: "Start an asynchronous multi-round keyword expansion. Returns task_id + progress only. Poll get_keyword_expansion_status; when completed you get discovered keywords with volume, CPC, competition, and CSV/JSON download links.",
           inputSchema: {
             type: "object",
             properties: {
@@ -492,12 +563,18 @@ export class McpSession extends DurableObject {
         },
         {
           name: "get_keyword_expansion_status",
-          description: "Poll an expansion task by task_id. Returns status (pending/processing/completed/failed), progress percent, depth, and keyword counts. Complete result rows are included by default; set include_results=false only for a lightweight progress check.",
+          description: "Poll an asynchronous keyword expansion task. In-progress responses return depth, seed progress, and found keyword count. When completed/processed, returns the discovered keywords with metrics, pagination support (page/page_size), volume filtering, and CSV/JSON downloads.",
           inputSchema: {
             type: "object",
             properties: {
               task_id: { type: "integer" },
-              include_results: { type: "boolean", default: true },
+              page: { type: "integer", minimum: 1, default: 1, description: "Result page number." },
+              page_size: { type: "integer", minimum: 1, maximum: 1000, default: 500, description: "Keywords per page (max 1000)." },
+              min_volume: { type: "integer", minimum: 0, description: "Filter keywords by minimum monthly volume." },
+              max_volume: { type: "integer", minimum: 0, description: "Filter keywords by maximum monthly volume." },
+              preview_limit: { type: "integer", minimum: 0, maximum: 1000, default: 100 },
+              include_results: { type: "boolean", default: true, description: "Include discovered keyword objects in the response." },
+              live: { type: "boolean", default: false, description: "Nudge task processor and return current progress." },
             },
             required: ["task_id"],
           },
@@ -607,9 +684,125 @@ export class McpSession extends DurableObject {
             if (keywords.length < 1) {
               throw new McpError(ErrorCode.InvalidParams, "keywords must contain at least one item");
             }
+            const summaryOpts = {
+              min_volume: toolArgs.min_volume !== undefined ? Number(toolArgs.min_volume) : undefined,
+              max_volume: toolArgs.max_volume !== undefined ? Number(toolArgs.max_volume) : undefined,
+              preview_limit: toolArgs.preview_limit !== undefined ? Number(toolArgs.preview_limit) : undefined,
+            };
+            const forceAsync = toolArgs.force_async === true || toolArgs.force_async === "true";
+            if (forceAsync || keywords.length > BULK_SYNC_LIMIT) {
+              try {
+                const res = await axiosInstance.post(
+                  "/api/v1/keywords/bulk-lookup/tasks",
+                  {
+                    keywords,
+                    with_history: toolArgs.with_history ?? toolArgs.historical ?? false,
+                    history_months: toolArgs.history_months ?? 12,
+                    location_id: toolArgs.location ?? toolArgs.location_id ?? "us",
+                    language_id: toolArgs.language ?? toolArgs.language_id ?? "en",
+                  },
+                  reqConfig,
+                );
+                const task = {
+                  task_id: res.data?.task_id,
+                  status: res.data?.status || "pending",
+                  total_keywords: keywords.length,
+                  completed_keywords: 0,
+                  progress: 0,
+                  result_count: 0,
+                  mode: "background_task",
+                  notice: `Created background task for ${keywords.length} keywords. Poll get_bulk_keyword_lookup_status — do not reprint rows in chat.`,
+                };
+                return {
+                  content: [{ type: "text" as const, text: formatBulkTaskText(task) }],
+                  structuredContent: { success: true, tool: name, ...task },
+                };
+              } catch (err) {
+                return toolResult({
+                  success: false,
+                  error: axiosErrorMessage(err, "Failed to create bulk lookup task"),
+                  hint: `Lists larger than ${BULK_SYNC_LIMIT} require the background bulk-lookup API. Authenticate with an API key and retry.`,
+                }, true, name);
+              }
+            }
+            const data = await completeMetrics(keywords, async batch => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords:batch,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}), reqConfig)).data);
+            return this.bulkResult(data, name, summaryOpts);
+          }
+          case "get_bulk_keyword_lookup_status": {
+            const taskId = Number(toolArgs.task_id);
+            if (!Number.isInteger(taskId) || taskId < 1) {
+              throw new McpError(ErrorCode.InvalidParams, "task_id must be a positive integer");
+            }
+            const summaryOpts = {
+              min_volume: toolArgs.min_volume !== undefined ? Number(toolArgs.min_volume) : undefined,
+              max_volume: toolArgs.max_volume !== undefined ? Number(toolArgs.max_volume) : undefined,
+              preview_limit: toolArgs.preview_limit !== undefined ? Number(toolArgs.preview_limit) : undefined,
+            };
+            try {
+              const res = await axiosInstance.get(`/api/v1/keywords/bulk-lookup/tasks/${taskId}`, reqConfig);
+              const task = (res.data?.task || res.data || {}) as Record<string, unknown>;
+              const status = String(task.status || "pending");
+              if (status !== "completed") {
+                const payload = {
+                  success: true,
+                  tool: name,
+                  mode: "background_task",
+                  task_id: taskId,
+                  status,
+                  progress: task.progress ?? 0,
+                  total_keywords: task.total_keywords,
+                  completed_keywords: task.completed_keywords,
+                  result_count: task.result_count,
+                  error: task.error ?? null,
+                };
+                return {
+                  content: [{ type: "text" as const, text: formatBulkTaskText(payload) }],
+                  structuredContent: payload,
+                };
+              }
+              // Paginated retrieval of results so any size (even 50,000+ keywords) can be read smoothly
+              const page = Math.max(1, Number(toolArgs.page || 1));
+              const pageSize = Math.min(1000, Math.max(1, Number(toolArgs.page_size || toolArgs.size || 1000)));
+              const allPages = (toolArgs.all_pages === true || toolArgs.all_pages === "true") && Number(task.result_count || 0) <= 2000;
 
-            const data = await completeMetrics(keywords, async keywords => (await axiosInstance.post("/api/v1/keywords/batch-metrics", keywordApiPayload({...toolArgs,keywords,with_history:toolArgs.with_history ?? toolArgs.historical ?? false}))).data);
-            return this.bulkResult(data, name);
+              let pageRows: Record<string, unknown>[] = [];
+              const total = Number(task.result_count || 0);
+
+              if (allPages) {
+                for (let p = 1; p === 1 || pageRows.length < total; p++) {
+                  const pageRes = await axiosInstance.get(`/api/v1/keywords/bulk-lookup/tasks/${taskId}`, {
+                    params: { results: 1, page: p, size: pageSize },
+                    ...reqConfig,
+                  });
+                  const chunk = Array.isArray(pageRes.data?.data) ? pageRes.data.data : [];
+                  pageRows.push(...chunk);
+                  if (chunk.length < pageSize || p >= 5) break;
+                }
+              } else {
+                const pageRes = await axiosInstance.get(`/api/v1/keywords/bulk-lookup/tasks/${taskId}`, {
+                  params: { results: 1, page, size: pageSize },
+                  ...reqConfig,
+                });
+                pageRows = Array.isArray(pageRes.data?.data) ? pageRes.data.data : [];
+              }
+
+              const result = await this.bulkResult({ success: true, data: pageRows, task }, name, summaryOpts);
+              const hasMore = (page * pageSize) < total;
+              (result.structuredContent as Record<string, unknown>).page = page;
+              (result.structuredContent as Record<string, unknown>).page_size = pageSize;
+              (result.structuredContent as Record<string, unknown>).total = total;
+              const firstContent = result.content[0];
+              if (hasMore && firstContent && "text" in firstContent) {
+                firstContent.text += `\n\n> 📌 Showing page ${page} of ${Math.ceil(total / pageSize)} (${pageRows.length} keywords). Call \`get_bulk_keyword_lookup_status(task_id: ${taskId}, page: ${page + 1})\` to fetch the next page.`;
+              }
+              return result;
+            } catch (err) {
+              return toolResult({
+                success: false,
+                task_id: taskId,
+                error: axiosErrorMessage(err, "Failed to fetch bulk lookup status"),
+              }, true, name);
+            }
           }
           case "start_keyword_expansion": {
             const seeds = parseSeedList(toolArgs);
@@ -629,7 +822,11 @@ export class McpSession extends DurableObject {
                   error: res.data?.error || "Expansion task was not created",
                 }, true, name);
               }
-              return toolResult(started, false, name);
+              const payload = { ...started, mode: "background_task", tool: name };
+              return {
+                content: [{ type: "text" as const, text: formatExpansionTaskText(payload) }],
+                structuredContent: payload,
+              };
             } catch (err) {
               return toolResult({
                 success: false,
@@ -650,21 +847,70 @@ export class McpSession extends DurableObject {
             if (!Number.isInteger(taskId) || taskId < 1) {
               throw new McpError(ErrorCode.InvalidParams, "task_id must be a positive integer");
             }
-            const includeResults = toolArgs.include_results !== false && toolArgs.include_results !== "false";
+            const summaryOpts = {
+              min_volume: toolArgs.min_volume !== undefined ? Number(toolArgs.min_volume) : undefined,
+              max_volume: toolArgs.max_volume !== undefined ? Number(toolArgs.max_volume) : undefined,
+              preview_limit: toolArgs.preview_limit !== undefined ? Number(toolArgs.preview_limit) : undefined,
+              page: toolArgs.page !== undefined ? Number(toolArgs.page) : 1,
+              page_size: toolArgs.page_size !== undefined ? Number(toolArgs.page_size) : 500,
+              include_results: toolArgs.include_results !== false,
+            };
             try {
-              const res = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}`, {
-                params: includeResults ? { sync_metrics: "1" } : { live: "1", kick: "1" },
+              const liveRes = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}`, {
+                params: { live: "1", kick: "1" },
                 ...reqConfig,
               });
-              const task = res.data?.data;
-              if (!task || typeof task !== "object") {
+              const liveTask = liveRes.data?.data;
+              if (!liveTask || typeof liveTask !== "object") {
                 return toolResult({
                   success: false,
                   task_id: taskId,
-                  error: res.data?.error || "Expansion task not found",
+                  error: liveRes.data?.error || "Expansion task not found",
                 }, true, name);
               }
-              return toolResult(normalizeExpansionStatus(task, taskId, includeResults), false, name);
+              const status = String(liveTask.status || "pending");
+              if (!isExpansionTerminal(status) || (status === "failed" && !Number(liveTask.found_keywords_count))) {
+                const payload = compactExpansionStatus(liveTask, taskId);
+                if (toolArgs.live === true && Array.isArray(liveTask.results) && liveTask.results.length > 0) {
+                  payload.current_results = liveTask.results.slice(0, 50);
+                }
+                return {
+                  content: [{ type: "text" as const, text: formatExpansionTaskText(payload) }],
+                  structuredContent: payload,
+                };
+              }
+
+              const fullRes = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}`, {
+                params: { sync_metrics: "1" },
+                ...reqConfig,
+              });
+              const task = (fullRes.data?.data || liveTask) as Record<string, unknown>;
+              const rows = Array.isArray(task.results) ? (task.results as Record<string, unknown>[]) : [];
+              const files = keywordExport({ success: true, data: rows, task }, name);
+              let csv = files.csv;
+              try {
+                const csvRes = await axiosInstance.get(`/api/v1/keywords/bulk-generate/task/${taskId}/export`, {
+                  ...reqConfig,
+                  responseType: "text",
+                  headers: { ...(reqConfig as { headers?: Record<string, string> }).headers, Accept: "text/csv" },
+                  transformResponse: [(d: string) => d],
+                });
+                if (typeof csvRes.data === "string" && csvRes.data.length > 0) {
+                  csv = csvRes.data;
+                }
+              } catch {
+                // Fall back to preview-derived CSV when the export endpoint is unavailable.
+              }
+              const total = Number(task.results_total ?? task.found_keywords_count ?? files.rowCount);
+              const exports = await this.storeExportFiles(csv, files.json, total || files.rowCount, name);
+              const payload = buildExpansionCompleteResponse(task, rows, exports, summaryOpts);
+              return {
+                content: [
+                  { type: "text" as const, text: formatExpansionCompleteText(payload) },
+                  ...this.exportResourceLinks(exports, name),
+                ],
+                structuredContent: payload,
+              };
             } catch (err) {
               return toolResult({
                 success: false,
